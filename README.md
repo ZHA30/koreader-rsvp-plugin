@@ -1,3 +1,8 @@
+- 汉化
+- 中文支持（以句为基础单位）
+
+---
+
 # FastReader Plugin for KOReader
 
 A powerful RSVP (Rapid Serial Visual Presentation) plugin that enables speed reading with advanced features for KOReader.

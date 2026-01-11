@@ -18,6 +18,7 @@ local CenterContainer = require("ui/widget/container/centercontainer")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
+local VerticalGroup = require("ui/widget/verticalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local OverlapGroup = require("ui/widget/overlapgroup")
 local LineWidget = require("ui/widget/linewidget")
@@ -39,8 +40,8 @@ local FastReader = WidgetContainer:extend{
 }
 
 function FastReader:onDispatcherRegisterActions()
-    Dispatcher:registerAction("fastreader_action", {category="none", event="FastReader", title=_("Fast Reader"), general=true,})
-    Dispatcher:registerAction("fastreader_rsvp", {category="none", event="FastReaderRSVP", title=_("RSVP Reading"), general=true,})
+    Dispatcher:registerAction("fastreader_action", {category="none", event="FastReader", title=_("快速阅读"), general=true,})
+    Dispatcher:registerAction("fastreader_rsvp", {category="none", event="FastReaderRSVP", title=_("RSVP 速读"), general=true,})
 end
 
 function FastReader:init()
@@ -78,6 +79,10 @@ function FastReader:init()
     -- Multi-word display settings
     self.words_preview_count = self.settings:readSetting("words_preview_count") or 3 -- Show current + 2 next words
     
+    -- Display size settings (percentage of screen)
+    self.display_width_percent = self.settings:readSetting("display_width_percent") or 90 -- 90% of screen width
+    self.display_height_percent = self.settings:readSetting("display_height_percent") or 25 -- 25% of screen height
+    
     -- Register for document events to setup callbacks when document is ready
     self.ui:registerPostReaderReadyCallback(function()
         self:setupTapHandler()
@@ -91,6 +96,8 @@ function FastReader:saveSettings()
         self.settings:saveSetting("show_position_indicator", self.show_position_indicator)
         self.settings:saveSetting("words_preview_count", self.words_preview_count)
         self.settings:saveSetting("ovp_alignment_enabled", self.ovp_alignment_enabled)
+        self.settings:saveSetting("display_width_percent", self.display_width_percent)
+        self.settings:saveSetting("display_height_percent", self.display_height_percent)
         self.settings:flush()
     end
 end
@@ -127,6 +134,198 @@ function FastReader:restoreOriginalView()
         -- Implementation would depend on KOReader's internal APIs
         self.original_view_mode = nil
     end
+end
+
+local function containsChineseText(text)
+    -- Simple check: if text contains Chinese punctuation, it's likely Chinese
+    return text:find("。") ~= nil or text:find("！") ~= nil or
+           text:find("？") ~= nil or text:find("；") ~= nil or
+           text:find("，") ~= nil or text:find("：") ~= nil
+end
+
+local function splitChineseSentences(text)
+    -- Advanced Chinese text splitting with semantic punctuation handling
+    -- 其后拆分 (split after): 。！？；……， 
+    -- 其前拆分 (split before): "'《〈【（ 
+    -- 双重标号拆分 (split after paired + sentence-ending): "。"！"？）。）！）？》。》！》？……。——！ 
+    
+    -- UTF-8 encoded punctuation marks
+    local after_split = {
+        ["。"] = true,  -- 。Chinese period
+        ["！"] = true,  -- ！Exclamation
+        ["？"] = true,  -- ？Question
+        ["；"] = true,  -- ；Semicolon
+        ["…"] = true,   -- …Ellipsis
+        ["，"] = true,   -- ，Chinese comma
+        ["、"] = true,   -- 、Colon
+        ["\n"] = true,  -- Newline
+    }
+    
+    local before_split = {
+        ["\226\128\156"] = true,  -- 'U+2018 Left single quote
+        ["《"] = true,  -- 《Left angle bracket
+        ["〈"] = true,  -- 〈Small left angle
+        ["【"] = true,  -- 【Left corner bracket
+        ["（"] = true,  -- （Left paren
+        [" "] = true,  --  Space
+    }
+    
+    -- Right/closing marks - split AFTER these (when standalone or paired with sentence-ending)
+    local closing_marks = {
+        ["\226\128\157"] = true,  -- 'U+2019 Right single quote
+        ["》"] = true,  -- 》Right angle bracket
+        ["〉"] = true,  -- 〉Small right angle
+        ["】"] = true,  -- 】Right corner bracket
+        ["）"] = true,  -- ）Right paren
+    }
+    
+    local segments = {}
+    local current = ""
+    local i = 1
+    
+    while i <= string.len(text) do
+        -- Get current UTF-8 character
+        local byte1 = string.byte(text, i)
+        local char_len = 1
+        local char = string.sub(text, i, i)
+        
+        if byte1 >= 192 and byte1 < 224 then
+            char_len = 2
+            char = string.sub(text, i, i + 1)
+        elseif byte1 >= 224 and byte1 < 240 then
+            char_len = 3
+            char = string.sub(text, i, i + 2)
+        elseif byte1 >= 240 then
+            char_len = 4
+            char = string.sub(text, i, i + 3)
+        end
+        
+        -- Look ahead for next character to check for double punctuation
+        local next_byte1 = string.byte(text, i + char_len)
+        local next_char_len = 1
+        local next_char = nil
+        
+        if next_byte1 then
+            if next_byte1 >= 192 and next_byte1 < 224 then
+                next_char_len = 2
+                next_char = string.sub(text, i + char_len, i + char_len + 1)
+            elseif next_byte1 >= 224 and next_byte1 < 240 then
+                next_char_len = 3
+                next_char = string.sub(text, i + char_len, i + char_len + 2)
+            elseif next_byte1 >= 240 then
+                next_char_len = 4
+                next_char = string.sub(text, i + char_len, i + char_len + 3)
+            else
+                next_char = string.sub(text, i + char_len, i + char_len)
+            end
+        end
+        
+        -- Check for 其前拆分 (split before opening marks)
+        if before_split[char] then
+            if current:match("[^ \t\n\r]") then
+                table.insert(segments, current)
+                current = char
+            else
+                current = current .. char
+            end
+        -- Check for double punctuation: closing mark + sentence-ending mark
+        -- 引号+句末: "。、"！、"？
+        -- 括号+句末: ）。、！）、？）
+        -- 书名号+句末: 》。、》！、》？
+        elseif closing_marks[char] and next_char and after_split[next_char] then
+            current = current .. char .. next_char
+            if current:match("[^ \t\n\r]") then
+                table.insert(segments, current)
+                current = ""
+            end
+            i = i + char_len + next_char_len
+            goto continue
+        -- Check for double punctuation: sentence-ending mark + closing mark
+        -- 句末+引号: "。、"！、"？
+        elseif after_split[char] and next_char and closing_marks[next_char] then
+            current = current .. char .. next_char
+            if current:match("[^ \t\n\r]") then
+                table.insert(segments, current)
+                current = ""
+            end
+            i = i + char_len + next_char_len
+            goto continue
+        -- Check for 组合后拆分 (split after closing paired marks without sentence-ending)
+        elseif closing_marks[char] then
+            current = current .. char
+            if current:match("[^ \t\n\r]") then
+                table.insert(segments, current)
+                current = ""
+            end
+        -- Check for 其后拆分 (split after sentence-ending marks)
+        elseif after_split[char] then
+            current = current .. char
+            if current:match("[^ \t\n\r]") then
+                table.insert(segments, current)
+                current = ""
+            end
+        else
+            current = current .. char
+        end
+        
+        i = i + char_len
+        ::continue::
+    end
+    
+    -- Add remaining text
+    if current:match("[^ \t\n\r]") then
+        table.insert(segments, current)
+    end
+    
+    -- If no segments found, return whole text as one
+    if #segments == 0 and text:match("[^ \t\n\r]") then
+        table.insert(segments, text)
+    end
+    
+    return segments
+end
+
+local function splitEnglishWords(text)
+    -- Split English text into words
+    local words = {}
+    for word in text:gmatch("%S+") do
+        -- Clean up word (remove some punctuation but keep basic structure)
+        word = word:gsub("^[%p]*", ""):gsub("[%p]*$", "")
+        if word and word ~= "" then
+            table.insert(words, word)
+        end
+    end
+    return words
+end
+
+local function calculateAdaptiveInterval(word, base_speed)
+    -- Adapt speed based on word/sentence length
+    -- Longer Chinese text needs more time to comprehend
+    local char_count = 0
+    
+    -- Count UTF-8 characters using util function
+    if util.splitToChars then
+        char_count = #util.splitToChars(word)
+    else
+        -- Fallback: estimate from byte length (most CJK chars are 3 bytes)
+        local byte_len = string.len(word)
+        char_count = math.ceil(byte_len / 3)
+    end
+    
+    if char_count <= 0 then
+        char_count = 1
+    end
+    
+    -- Adaptive factor: longer text = slower reading
+    -- For Chinese sentences, each character adds 20% more time than base
+    local adaptive_factor = 1.0
+    if char_count > 1 then
+        adaptive_factor = 1.0 + (char_count - 1) * 0.2
+    end
+    
+    -- Calculate interval: base_interval * adaptive_factor
+    local base_interval = 60000 / base_speed  -- Convert WPM to ms
+    return math.floor(base_interval * adaptive_factor)
 end
 
 function FastReader:extractWordsFromCurrentPage()
@@ -226,25 +425,71 @@ function FastReader:extractWordsFromCurrentPage()
         logger.info("FastReader: Debug info: " .. table.concat(debug_info, " | "))
         
         UIManager:show(InfoMessage:new{
-            text = _("Cannot extract text from this document type"),
+            text = _("无法从此文档类型中提取文本"),
             timeout = 3,
         })
         
         return {}
     end
     
-    -- Split text into words, removing punctuation and extra spaces
+    -- Detect if text contains Chinese and split accordingly
     local words = {}
-    for word in text:gmatch("%S+") do
-        -- Clean up word (remove some punctuation but keep basic structure)
-        word = word:gsub("^[%p]*", ""):gsub("[%p]*$", "")
-        if word and word ~= "" then
-            table.insert(words, word)
+    if containsChineseText(text) then
+        logger.info("FastReader: Chinese text detected, using sentence splitting")
+        words = splitChineseSentences(text)
+    else
+        logger.info("FastReader: English text detected, using word splitting")
+        words = splitEnglishWords(text)
+    end
+    
+    logger.info("FastReader: Successfully extracted " .. #words .. " units")
+    return words
+end
+
+local function wrapTextByWidth(text, face, max_width, max_lines, bold)
+    -- Wrap text to fit within max_width
+    -- bold: whether text should be measured with bold font
+    -- If max_lines is provided and text exceeds it, text will be truncated
+    -- If max_lines is nil or very large, all text will be shown
+    if not text or text == "" then
+        return {""}
+    end
+    
+    local lines = {}
+    local current_line = ""
+    local chars = util.splitToChars(text)
+    
+    for idx, char in ipairs(chars) do
+        local test_line = current_line .. char
+        local metrics = RenderText:sizeUtf8Text(0, Screen:getWidth(), face, test_line, true, bold)
+        
+        if metrics and metrics.x and metrics.x > max_width then
+            -- Current line is full, need to start new line
+            -- Check if this is the last character - if so, force it onto this line
+            local is_last_char = (idx == #chars)
+            if is_last_char then
+                -- Force last char onto current line even if it exceeds
+                current_line = test_line
+            else
+                if max_lines and #lines >= max_lines then
+                    -- Force remaining chars onto last line
+                    current_line = current_line .. char
+                else
+                    table.insert(lines, current_line)
+                    current_line = char
+                end
+            end
+        else
+            current_line = test_line
         end
     end
     
-    logger.info("FastReader: Successfully extracted " .. #words .. " words")
-    return words
+    -- Add remaining text
+    if current_line ~= "" then
+        table.insert(lines, current_line)
+    end
+    
+    return #lines > 0 and lines or {""}
 end
 
 local function getOptimalRecognitionIndex(char_count)
@@ -314,14 +559,20 @@ function FastReader:showRSVPWord(current_word)
         end
     end
     
-    -- Fixed dimensions for stable display; tighten frame when showing fewer words
-    local width_ratio = (self.words_preview_count <= 2) and 0.7 or 0.9
-    local fixed_width = math.floor(Screen:getWidth() * width_ratio)
-    local max_width = math.max(Screen:getWidth() - Screen:scaleBySize(40), Screen:scaleBySize(220))
-    local min_width = math.min(Screen:scaleBySize(320), max_width)
-    fixed_width = math.max(fixed_width, min_width)
-    fixed_width = math.min(fixed_width, max_width)
-    local fixed_height = Screen:scaleBySize(120)
+    -- Fixed dimensions based on display size percentage settings
+    local fixed_width = math.floor(Screen:getWidth() * (self.display_width_percent / 100))
+    local fixed_height = math.floor(Screen:getHeight() * (self.display_height_percent / 100))
+    
+    -- Enforce minimum and maximum size limits
+    -- For width: keep reasonable bounds but respect percentage
+    local min_width = Screen:scaleBySize(220)
+    local max_width = Screen:getWidth() - Screen:scaleBySize(40)
+    fixed_width = math.max(min_width, math.min(fixed_width, max_width))
+    
+    -- For height: don't artificially limit the percentage setting too much
+    -- Allow percentages to be respected, but keep a minimum for usability
+    local min_height = Screen:scaleBySize(60)
+    fixed_height = math.max(min_height, fixed_height)
     local text_padding = Screen:scaleBySize(20)
     local inner_width = fixed_width - (text_padding * 2)
     local inner_height = fixed_height - (text_padding * 2)
@@ -367,14 +618,68 @@ function FastReader:showRSVPWord(current_word)
         local is_current = (i == 1)
         local word_color = is_current and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY
 
-        local word_widget = TextWidget:new{
-            text = word,
-            face = is_current and anchor_face or secondary_face,
-            bold = is_current,
-            fgcolor = word_color,
-        }
+        -- Check if current word needs wrapping
+        local word_widget
+        local face = is_current and anchor_face or secondary_face
+        local word_metrics = RenderText:sizeUtf8Text(0, Screen:getWidth(), face, word, true, is_current)
+        
+        local is_wrapped = false
+        if word_metrics and word_metrics.x and word_metrics.x > inner_width - base_right_padding - 20 then
+            -- Word is too long, wrap it into multiple lines
+            -- For wrapped text, use the full available inner width
+            -- inner_width already accounts for frame padding (text_padding * 2)
+            local wrap_width = inner_width - Screen:scaleBySize(10)
+            -- Use 4 lines max to fit within display height (120px height - 40px padding = ~80px, ~20px per line)
+            local wrapped_lines = wrapTextByWidth(word, face, wrap_width, 4, is_current)
+            
+            if #wrapped_lines > 1 then
+                is_wrapped = true
+                -- Use VerticalGroup for multi-line display
+                local group = VerticalGroup:new{}
+                for _, line in ipairs(wrapped_lines) do
+                    local line_widget = TextWidget:new{
+                        text = line,
+                        face = face,
+                        bold = is_current,
+                        fgcolor = word_color,
+                    }
+                    table.insert(group, line_widget)
+                end
+                word_widget = group
+            else
+                -- Single line is fine
+                word_widget = TextWidget:new{
+                    text = wrapped_lines[1] or word,
+                    face = face,
+                    bold = is_current,
+                    fgcolor = word_color,
+                }
+            end
+        else
+            -- Normal single-line widget
+            word_widget = TextWidget:new{
+                text = word,
+                face = face,
+                bold = is_current,
+                fgcolor = word_color,
+            }
+        end
 
-        local widget_width = word_widget:getSize().w
+        -- For VerticalGroup, we need to get dimensions differently
+        local widget_width
+        local widget_classname = word_widget.classname or ""
+        if widget_classname == "VerticalGroup" then
+            -- VerticalGroup - wrap in CenterContainer with minimal padding
+            local wrapper_width = inner_width - Screen:scaleBySize(10)
+            local wrapper = CenterContainer:new{
+                dimen = Geom:new{ w = wrapper_width, h = inner_height },
+                word_widget,
+            }
+            widget_width = wrapper_width
+            word_widget = wrapper
+        else
+            widget_width = word_widget:getSize().w
+        end
         table.insert(layout_items, {
             widget = word_widget,
             width = widget_width,
@@ -543,13 +848,19 @@ function FastReader:showRSVPWord(current_word)
         return true
     end
     
-    -- Remove previous RSVP widget if exists
+    -- Remove previous RSVP widget if exists and do incremental refresh
     if self.rsvp_widget then
-        UIManager:close(self.rsvp_widget)
+        local refresh_region = self.rsvp_widget.dimen or {
+            x = 0, y = 0,
+            w = Screen:getWidth(),
+            h = Screen:getHeight()
+        }
+        UIManager:close(self.rsvp_widget, "ui", refresh_region)
     end
     
     self.rsvp_widget = container
-    UIManager:show(self.rsvp_widget)
+    -- Use incremental refresh - only refresh the container area
+    UIManager:show(self.rsvp_widget, "ui", self.rsvp_widget.dimen)
 end
 
 function FastReader:startRSVP()
@@ -571,7 +882,7 @@ function FastReader:startRSVP()
     if #self.words == 0 then
         -- Show error message and abort
         UIManager:show(InfoMessage:new{
-            text = _("Cannot extract text from this document. Check logs for details."),
+            text = _("无法从文档中提取文本。请查看日志了解详情。"),
             timeout = 5,
         })
         logger.warn("FastReader: Cannot start RSVP - no words extracted")
@@ -594,9 +905,11 @@ function FastReader:startRSVP()
         logger.info("FastReader: Starting from beginning")
     end
     
-    -- Calculate interval in milliseconds
-    local interval = 60000 / self.rsvp_speed  -- Convert WPM to milliseconds per word
-    logger.info("FastReader: RSVP interval set to " .. interval .. "ms for " .. self.rsvp_speed .. " WPM")
+    -- Calculate adaptive interval based on first word length
+    local first_word = self.words[self.current_word_index]
+    local interval = calculateAdaptiveInterval(first_word, self.rsvp_speed)
+    local char_count = util.splitToChars and #util.splitToChars(first_word) or string.len(first_word)
+    logger.info("FastReader: RSVP adaptive interval for '" .. first_word .. "' (len=" .. char_count .. "): " .. interval .. "ms at " .. self.rsvp_speed .. " WPM")
     
     -- Start RSVP timer
     if self.rsvp_timer then
@@ -657,7 +970,7 @@ function FastReader:stopRSVP()
     self:restoreOriginalView()
     
     UIManager:show(InfoMessage:new{
-        text = _("RSVP stopped"),
+        text = _("速读已停止"),
         timeout = 1.5,
     })
 end
@@ -671,10 +984,11 @@ function FastReader:rsvpTick()
     
     if self.current_word_index <= #self.words then
         -- Show next word
-        self:showRSVPWord(self.words[self.current_word_index])
+        local current_word = self.words[self.current_word_index]
+        self:showRSVPWord(current_word)
         
-        -- Schedule next tick
-        local interval = 60000 / self.rsvp_speed
+        -- Schedule next tick with adaptive interval
+        local interval = calculateAdaptiveInterval(current_word, self.rsvp_speed)
         if self.rsvp_timer then
             UIManager:unschedule(self.rsvp_timer)
             self.rsvp_timer = nil
@@ -708,7 +1022,7 @@ function FastReader:goToNextPageAndContinueRSVP()
             logger.info("FastReader: Already at last page")
             self:stopRSVP()
             UIManager:show(InfoMessage:new{
-                text = _("End of document reached"),
+                text = _("已到达文档末尾"),
                 timeout = 2,
             })
             return
@@ -726,7 +1040,7 @@ function FastReader:goToNextPageAndContinueRSVP()
             logger.info("FastReader: Could not scroll further in rolling mode")
             self:stopRSVP()
             UIManager:show(InfoMessage:new{
-                text = _("End of document reached"),
+                text = _("已到达文档末尾"),
                 timeout = 2,
             })
             return
@@ -766,10 +1080,11 @@ function FastReader:continueRSVPWithNewPage()
         logger.info("FastReader: Extracted " .. #new_words .. " words from new page")
         
         -- Continue with first word of new page
-        self:showRSVPWord(self.words[self.current_word_index])
+        local first_word = self.words[self.current_word_index]
+        self:showRSVPWord(first_word)
         
-        -- Schedule next tick
-        local interval = 60000 / self.rsvp_speed
+        -- Schedule next tick with adaptive interval
+        local interval = calculateAdaptiveInterval(first_word, self.rsvp_speed)
         if self.rsvp_timer then
             UIManager:unschedule(self.rsvp_timer)
             self.rsvp_timer = nil
@@ -796,17 +1111,17 @@ end
 
 function FastReader:addToMainMenu(menu_items)
     menu_items.fastreader = {
-        text = _("FastReader"),
+        text = _("快速阅读"),
         sorting_hint = "more_tools",
         sub_item_table = {
             {
-                text = _("Start/Stop RSVP"),
+                text = _("开始/停止速读"),
                 callback = function()
                     self:toggleRSVP()
                 end,
             },
             {
-                text = _("Tap on Text to Launch RSVP"),
+                text = _("点击文本启动速读"),
                 checked_func = function()
                     return self.tap_to_launch_enabled
                 end,
@@ -816,20 +1131,20 @@ function FastReader:addToMainMenu(menu_items)
                     
                     if self.tap_to_launch_enabled then
                         UIManager:show(InfoMessage:new{
-                            text = _("Tap-to-launch RSVP enabled. Tap on text to start RSVP reading."),
+                            text = _("点击文本启动速读已启用。点击文本即可开始速读。"),
                             timeout = 3,
                         })
                     else
                         UIManager:show(InfoMessage:new{
-                            text = _("Tap-to-launch RSVP disabled"),
+                            text = _("点击文本启动速读已禁用"),
                             timeout = 2,
                         })
                     end
                 end,
-                help_text = _("When enabled, tapping on text will automatically start RSVP reading without going through the menu."),
+                help_text = _("启用后，点击文本可直接开始速读，无需进入菜单。"),
             },
             {
-                text = _("Show Reading Position"),
+                text = _("显示阅读位置"),
                 checked_func = function()
                     return self.show_position_indicator
                 end,
@@ -839,20 +1154,20 @@ function FastReader:addToMainMenu(menu_items)
                     
                     if self.show_position_indicator then
                         UIManager:show(InfoMessage:new{
-                            text = _("Position indicator enabled. Shows reading progress when resuming."),
+                            text = _("位置指示器已启用。恢复速读时显示阅读进度。"),
                             timeout = 3,
                         })
                     else
                         UIManager:show(InfoMessage:new{
-                            text = _("Position indicator disabled"),
+                            text = _("位置指示器已禁用"),
                             timeout = 2,
                         })
                     end
                 end,
-                help_text = _("When enabled, shows reading position indicator when resuming RSVP on the same page."),
+                help_text = _("启用后，在同一页面恢复速读时显示阅读位置指示器。"),
             },
             {
-                text = _("Optimal Alignment (OVP)"),
+                text = _("最佳对齐(OVP)"),
                 checked_func = function()
                     return self.ovp_alignment_enabled
                 end,
@@ -862,28 +1177,28 @@ function FastReader:addToMainMenu(menu_items)
 
                     if self.ovp_alignment_enabled then
                         UIManager:show(InfoMessage:new{
-                            text = _("Optimal alignment enabled. Words align to the focus crosshair."),
+                            text = _("最佳对齐已启用。词句按焦点十字准线对齐。"),
                             timeout = 3,
                         })
                     else
                         UIManager:show(InfoMessage:new{
-                            text = _("Optimal alignment disabled. Words center in the widget."),
+                            text = _("最佳对齐已禁用。词句在小部件中居中。"),
                             timeout = 3,
                         })
                     end
                 end,
-                help_text = _("Aligns each word to its optimal recognition point and shows the subtle crosshair guide."),
+                help_text = _("将每个词句与其最优识别点对齐，并显示细致的十字准线。"),
             },
             {
                 text_func = function()
-                    return T(_("Preview Words: %1"), self.words_preview_count)
+                    return T(_("预览词句: %1"), self.words_preview_count)
                 end,
                 keep_menu_open = true,
                 callback = function(touchmenu_instance)
                     local SpinWidget = require("ui/widget/spinwidget")
                     local spin_widget = SpinWidget:new{
-                        title_text = _("RSVP Preview Words"),
-                        info_text = _("Number of words to show in RSVP widget (1-10)"),
+                        title_text = _("RSVP预览词句"),
+                        info_text = _("在RSVP小部件中显示的词句数(1-10)"),
                         width = math.floor(Screen:getWidth() * 0.6),
                         value = self.words_preview_count,
                         value_min = 1,
@@ -891,34 +1206,98 @@ function FastReader:addToMainMenu(menu_items)
                         value_step = 1,
                         value_hold_step = 2,
                         default_value = 3,
-                        unit = _("words"),
+                        unit = _("个"),
                         callback = function(spin)
                             self.words_preview_count = spin.value
                             self:saveSettings()
                             touchmenu_instance:updateItems()
                             UIManager:show(InfoMessage:new{
-                                text = T(_("Preview words set to %1"), self.words_preview_count),
+                                text = T(_("预览词句设置为 %1"), self.words_preview_count),
                                 timeout = 2,
                             })
                         end
                     }
                     UIManager:show(spin_widget)
                 end,
-                help_text = _("Controls how many words are shown in the RSVP widget. The current word is highlighted, upcoming words are dimmed."),
+                help_text = _("控制RSVP小部件中显示的词句数。当前词句高亮，后续词句变暗。"),
             },
             {
-                text = _("RSVP Speed"),
+                text_func = function()
+                    return _("显示宽度: ") .. self.display_width_percent .. "%"
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local spin_widget = SpinWidget:new{
+                        title_text = _("RSVP显示宽度"),
+                        info_text = _("RSVP文本框占屏幕宽度的百分比(20%-100%)"),
+                        width = math.floor(Screen:getWidth() * 0.6),
+                        value = self.display_width_percent,
+                        value_min = 20,
+                        value_max = 100,
+                        value_step = 5,
+                        value_hold_step = 10,
+                        default_value = 90,
+                        unit = "%",
+                        callback = function(spin)
+                            self.display_width_percent = spin.value
+                            self:saveSettings()
+                            touchmenu_instance:updateItems()
+                            UIManager:show(InfoMessage:new{
+                                text = string.format(_("显示宽度设置为 %d%%"), self.display_width_percent),
+                                timeout = 2,
+                            })
+                        end
+                    }
+                    UIManager:show(spin_widget)
+                end,
+                help_text = _("控制RSVP文本框的宽度，以屏幕宽度的百分比表示。默认90%。"),
+            },
+            {
+                text_func = function()
+                    return _("显示高度: ") .. self.display_height_percent .. "%"
+                end,
+                keep_menu_open = true,
+                callback = function(touchmenu_instance)
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local spin_widget = SpinWidget:new{
+                        title_text = _("RSVP显示高度"),
+                        info_text = _("RSVP文本框占屏幕高度的百分比(10%-50%)"),
+                        width = math.floor(Screen:getWidth() * 0.6),
+                        value = self.display_height_percent,
+                        value_min = 10,
+                        value_max = 50,
+                        value_step = 5,
+                        value_hold_step = 10,
+                        default_value = 25,
+                        unit = "%",
+                        callback = function(spin)
+                            self.display_height_percent = spin.value
+                            self:saveSettings()
+                            touchmenu_instance:updateItems()
+                            UIManager:show(InfoMessage:new{
+                                text = string.format(_("显示高度设置为 %d%%"), self.display_height_percent),
+                                timeout = 2,
+                            })
+                        end
+                    }
+                    UIManager:show(spin_widget)
+                end,
+                help_text = _("控制RSVP文本框的高度，以屏幕高度的百分比表示。默认25%。"),
+            },
+            {
+                text = _("速读速度"),
                 sub_item_table = {
                     {
                         text_func = function()
-                            return T(_("Current: %1 WPM"), self.rsvp_speed)
+                            return T(_("当前: %1 WPM"), self.rsvp_speed)
                         end,
                         keep_menu_open = true,
                         callback = function(touchmenu_instance)
                             local SpinWidget = require("ui/widget/spinwidget")
                             local spin_widget = SpinWidget:new{
-                                title_text = _("RSVP Reading Speed"),
-                                info_text = _("Words per minute (50-1000)"),
+                                title_text = _("RSVP阅读速度"),
+                                info_text = _("每分钟词句数(50-1000)"),
                                 width = math.floor(Screen:getWidth() * 0.6),
                                 value = self.rsvp_speed,
                                 value_min = 50,
@@ -932,7 +1311,7 @@ function FastReader:addToMainMenu(menu_items)
                                     self:saveSettings()
                                     touchmenu_instance:updateItems()
                                     UIManager:show(InfoMessage:new{
-                                        text = T(_("RSVP speed set to %1 WPM"), self.rsvp_speed),
+                                        text = T(_("RSVP速度设置为 %1 WPM"), self.rsvp_speed),
                                         timeout = 1,
                                     })
                                 end
@@ -942,78 +1321,78 @@ function FastReader:addToMainMenu(menu_items)
                         separator = true,
                     },
                     {
-                        text = _("100 WPM (Very slow)"),
+                        text = _("100 WPM (极慢)"),
                         callback = function()
                             self.rsvp_speed = 100
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 100 WPM"),
+                                text = _("RSVP速度设置为 100 WPM"),
                                 timeout = 1,
                             })
                         end,
                     },
                     {
-                        text = _("150 WPM (Slow)"),
+                        text = _("150 WPM (慢)"),
                         callback = function()
                             self.rsvp_speed = 150
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 150 WPM"),
+                                text = _("RSVP速度设置为 150 WPM"),
                                 timeout = 1,
                             })
                         end,
                     },
                     {
-                        text = _("200 WPM (Normal)"),
+                        text = _("200 WPM (标准)"),
                         callback = function()
                             self.rsvp_speed = 200
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 200 WPM"),
+                                text = _("RSVP速度设置为 200 WPM"),
                                 timeout = 1,
                             })
                         end,
                     },
                     {
-                        text = _("250 WPM (Fast)"),
+                        text = _("250 WPM (快)"),
                         callback = function()
                             self.rsvp_speed = 250
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 250 WPM"),
+                                text = _("RSVP速度设置为 250 WPM"),
                                 timeout = 1,
                             })
                         end,
                     },
                     {
-                        text = _("300 WPM (Very fast)"),
+                        text = _("300 WPM (很快)"),
                         callback = function()
                             self.rsvp_speed = 300
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 300 WPM"),
+                                text = _("RSVP速度设置为 300 WPM"),
                                 timeout = 1,
                             })
                         end,
                     },
                     {
-                        text = _("400 WPM (Extreme)"),
+                        text = _("400 WPM (极快)"),
                         callback = function()
                             self.rsvp_speed = 400
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 400 WPM"),
+                                text = _("RSVP速度设置为 400 WPM"),
                                 timeout = 1,
                             })
                         end,
                     },
                     {
-                        text = _("500 WPM (Ultra fast)"),
+                        text = _("500 WPM (超快)"),
                         callback = function()
                             self.rsvp_speed = 500
                             self:saveSettings()
                             UIManager:show(InfoMessage:new{
-                                text = _("RSVP speed set to 500 WPM"),
+                                text = _("RSVP速度设置为 500 WPM"),
                                 timeout = 1,
                             })
                         end,
@@ -1043,7 +1422,7 @@ function FastReader:onKeyPress(key)
             UIManager:unschedule(self.rsvp_timer)
             self.rsvp_timer = nil
             UIManager:show(InfoMessage:new{
-                text = _("RSVP paused"),
+                text = _("速读已暂停"),
                 timeout = 1,
             })
         else
@@ -1054,7 +1433,7 @@ function FastReader:onKeyPress(key)
             end
             UIManager:scheduleIn(interval / 1000, self.rsvp_timer)
             UIManager:show(InfoMessage:new{
-                text = _("RSVP resumed"),
+                text = _("速读已继续"),
                 timeout = 1,
             })
         end
